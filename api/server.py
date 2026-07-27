@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import logging
 import os
 import re
@@ -33,7 +34,8 @@ import soundfile as sf
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import Response
 
-from api.engine_pool import configure, get_engine, close_engine
+from api import engine_pool
+from api.engine_pool import close_engine, configure, get_engine, preload
 from api.models import (
     AudioFormat,
     BatchResultItem,
@@ -70,7 +72,20 @@ logger = logging.getLogger("vieneu.api")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure(mode=_ENGINE_MODE)
-    logger.info("VieNeu-TTS API started (mode=%s, auth=%s)", _ENGINE_MODE, bool(_API_KEY))
+
+    # NẠP SẴN model NGAY lúc khởi động, ĐỒNG BỘ, trước khi app nhận request.
+    # Trước đây engine nạp lazy ở lần get_engine() đầu tiên → client probe GET /health
+    # (timeout 5s) trúng ngay lúc đang nạp model → timeout → client kết luận nhầm
+    # "VieNeu-TTS không phản hồi" → pipeline sản xuất chết ở lần bấm ĐẦU TIÊN.
+    logger.info("VieNeu-TTS API đang khởi động (mode=%s, auth=%s)...", _ENGINE_MODE, bool(_API_KEY))
+    ok = preload(do_warmup=os.getenv("VIENEU_WARMUP", "1").lower() not in ("0", "false", "no"))
+    if ok:
+        st = engine_pool.get_state()
+        logger.info("✅ VieNeu-TTS API sẵn sàng (device=%s, nạp %.1fs)",
+                    st["device"], st["load_seconds"])
+    else:
+        logger.error("⚠️ Engine CHƯA sẵn sàng lúc khởi động — xem GET /health để biết lý do")
+
     yield
     close_engine()
     logger.info("VieNeu-TTS API stopped")
@@ -210,18 +225,36 @@ def _decode_ref_audio(ref_audio_b64: str) -> str:
 
 @app.get("/health", response_model=HealthResponse, tags=["System"])
 def health() -> HealthResponse:
-    """Kiểm tra trạng thái server."""
-    try:
-        engine = get_engine()
-        device = getattr(engine, "device", "cpu")
-    except Exception:
-        device = "unknown"
+    """Kiểm tra trạng thái server — TRẢ VỀ NGAY, tuyệt đối không chạm model.
+
+    Bản cũ gọi get_engine() ở đây, nên chính health check lại kích hoạt nạp model và
+    block hàng chục giây. Client (voice_agent) probe với timeout 5s → luôn timeout ở
+    lần chạy đầu → báo nhầm "server chưa khởi động" và giết cả pipeline.
+
+    `status` = "ok" khi engine sẵn sàng, "loading" khi đang nạp, "error" khi nạp lỗi.
+    Client phải đọc `engine_ready` để quyết định chờ hay bỏ.
+    """
+    st = engine_pool.get_state()
+    status = {"ready": "ok", "loading": "loading", "error": "error"}.get(st["state"], "loading")
     return HealthResponse(
-        status="ok",
+        status=status,
         version=_VERSION,
         engine=_ENGINE_MODE,
-        device=str(device),
+        device=st["device"],
+        engine_ready=st["ready"],
+        engine_state=st["state"],
+        load_seconds=st["load_seconds"],
+        error=st["error"],
     )
+
+
+@app.get("/health/ready", tags=["System"])
+def health_ready() -> Response:
+    """Readiness probe: 200 khi sẵn sàng nhận TTS, 503 khi chưa. Không chạm model."""
+    st = engine_pool.get_state()
+    body = json.dumps(st, ensure_ascii=False)
+    return Response(content=body, media_type="application/json",
+                    status_code=200 if st["ready"] else 503)
 
 
 @app.get("/v1/voices", response_model=VoiceListResponse, tags=["Voices"])
@@ -272,7 +305,9 @@ def synthesize(
             if req.ref_text:
                 kwargs["ref_text"] = req.ref_text
 
-        audio: np.ndarray = engine.infer(**kwargs)
+        # Qua engine_pool.infer() để tuần tự hoá: engine KHÔNG thread-safe, mà FastAPI
+        # chạy endpoint sync này trong threadpool nhiều thread.
+        audio: np.ndarray = engine_pool.infer(**kwargs)
         sr = getattr(engine, "sample_rate", 48000)
         audio_bytes = _audio_to_bytes(audio, sr, req.format)
 
@@ -347,7 +382,7 @@ def synthesize_batch(
                 if item.ref_text:
                     kwargs["ref_text"] = item.ref_text
 
-            audio: np.ndarray = engine.infer(**kwargs)
+            audio: np.ndarray = engine_pool.infer(**kwargs)
             audio_bytes = _audio_to_bytes(audio, sr, req.format)
             elapsed_ms = (time.perf_counter() - t0) * 1000
             results.append(BatchResultItem(
@@ -394,7 +429,7 @@ def openai_speech(
         kwargs: dict = {"text": req.input, **req.infer_overrides()}
         if voice:
             kwargs["voice"] = voice
-        audio: np.ndarray = engine.infer(**kwargs)
+        audio: np.ndarray = engine_pool.infer(**kwargs)
         sr = getattr(engine, "sample_rate", 48000)
 
         fmt_map = {"wav": AudioFormat.wav, "mp3": AudioFormat.mp3, "flac": AudioFormat.flac}

@@ -167,7 +167,14 @@ class BatchTTSResponse(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    status: str
+    status: str          # "ok" | "loading" | "error"
     version: str
     engine: str
     device: str
+    # Client PHẢI đọc engine_ready để phân biệt "server sống nhưng đang nạp model"
+    # với "server sẵn sàng". Thiếu thông tin này, client chỉ thấy 200 OK rồi gửi TTS
+    # ngay và ăn timeout ở lần chạy đầu.
+    engine_ready: bool = True
+    engine_state: str = "ready"
+    load_seconds: float = 0.0
+    error: Optional[str] = None
